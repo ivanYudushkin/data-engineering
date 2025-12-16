@@ -283,7 +283,7 @@ object HiveToClickHouseReplace extends App {
   df = df.persist(StorageLevel.DISK_ONLY)
   val rowCount = df.count()
 
-  val comp = compressionForRows(rowCount)
+  private val comp = compressionForRows(rowCount)
   val normalized = normalizeForWrite(df)
 
   val (chHost, chPort) = parseHostAndPort(chHostRaw)

@@ -1,0 +1,13 @@
+[debug] Created transactional ClassFileManager with tempDir = /workspace/spark-hive-to-clickhouse-loader/target/scala-2.12/classes.bak
+[debug] About to delete class files:
+[debug] We backup class files:
+[debug] Created transactional ClassFileManager with tempDir = /workspace/spark-hive-to-clickhouse-loader/target/scala-2.12/classes.bak
+[debug] About to delete class files:
+[debug] We backup class files:
+[debug] Registering generated classes:
+[debug] 	HiveToClickHouseReplace$delayedInit$body.class
+[debug] 	HiveToClickHouseReplace$.class
+[debug] 	HiveToClickHouseReplace.class
+[debug] 	HiveToClickHouseReplace$Compression.class
+[debug] 	HiveToClickHouseReplace$Compression$.class
+[debug] Removing the temporary directory used for backing up class files: /workspace/spark-hive-to-clickhouse-loader/target/scala-2.12/classes.bak

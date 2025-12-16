@@ -1,0 +1,3 @@
+[debug] not up to date. inChanged = true, force = false
+[debug] Updating ProjectRef(uri("file:/workspace/spark-hive-to-clickhouse-loader/project/"), "spark-hive-to-clickhouse-loader-build")...
+[debug] Done updating ProjectRef(uri("file:/workspace/spark-hive-to-clickhouse-loader/project/"), "spark-hive-to-clickhouse-loader-build")
