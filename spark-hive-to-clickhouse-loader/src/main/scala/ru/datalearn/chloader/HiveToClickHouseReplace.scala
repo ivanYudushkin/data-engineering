@@ -129,7 +129,9 @@ object HiveToClickHouseReplace extends App {
     finally conn.close()
   }
 
-  private case class Compression(zstd: Int, lz4hc: Int)
+  // Must not be private: otherwise Scala may infer a public member type as private and fail compilation
+  // with "private class Compression escapes its defining scope".
+  case class Compression(zstd: Int, lz4hc: Int)
 
   private def compressionForRows(rows: Long): Compression = {
     // landing: keep moderate compression
