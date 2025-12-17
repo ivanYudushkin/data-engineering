@@ -21,9 +21,9 @@ import java.util.Properties
   * - CLICKHOUSE_PASSWORD=pass
   * - CLICKHOUSE_TARGET=schema.table (optional; default = HIVE_SOURCE)
   * - CLICKHOUSE_CLUSTER=clusterName
-  * - CLICKHOUSE_PARTITION_BY=expression
+  * - CLICKHOUSE_PARTITION_BY=expression (optional)
   * - CLICKHOUSE_ORDER_BY=expression (comma-separated ClickHouse expressions)
-  * - CLICKHOUSE_SHARDING_KEY=expression (optional; default cityHash64(first order-by column))
+  * - CLICKHOUSE_SHARDING_KEY=expression (optional; default = first ORDER BY column; will be wrapped to non-null UInt64)
   *
   * - JDBC_BATCHSIZE=50000 (optional)
   */
@@ -84,7 +84,7 @@ object HiveToClickHouseReplace extends App {
   private val chPass = required(params, "CLICKHOUSE_PASSWORD")
   private val chTarget = params.getOrElse("CLICKHOUSE_TARGET", hiveSource).trim
   private val chCluster = required(params, "CLICKHOUSE_CLUSTER")
-  private val chPartitionBy = required(params, "CLICKHOUSE_PARTITION_BY")
+  private val chPartitionBy = opt(params, "CLICKHOUSE_PARTITION_BY")
   private val chOrderBy = required(params, "CLICKHOUSE_ORDER_BY")
   private val chShardingKey = opt(params, "CLICKHOUSE_SHARDING_KEY")
 
@@ -154,8 +154,23 @@ object HiveToClickHouseReplace extends App {
     if (ident.matches("[A-Za-z_][A-Za-z0-9_]*")) Some(ident) else None
   }
 
-  private def defaultShardingKey(orderBy: String): String =
-    firstOrderByIdentifier(orderBy).map(c => s"cityHash64($c)").getOrElse("rand()")
+  /**
+    * ClickHouse Distributed sharding expression must be a NON-Nullable integer type.
+    *
+    * Many hash functions become Nullable when fed with Nullable arguments
+    * (e.g. cityHash64(toString(Nullable(String))) -> Nullable(UInt64)),
+    * which breaks CREATE TABLE ... ENGINE = Distributed(..., sharding_key).
+    *
+    * This helper makes sharding expression always UInt64 (non-nullable) by hashing a non-null string.
+    */
+  private def safeShardingExpr(rawExpr: String): String = {
+    val e = rawExpr.trim
+    // Always force non-null output: ifNull(toString(expr), '') becomes String, then cityHash64(String) -> UInt64
+    s"cityHash64(ifNull(toString(($e)), ''))"
+  }
+
+  private def defaultShardingKeySeed(orderBy: String): String =
+    firstOrderByIdentifier(orderBy).getOrElse("rand()")
 
   private def codecForClickHouseType(chType: String, comp: Compression): String = {
     val base = chType
@@ -208,18 +223,23 @@ object HiveToClickHouseReplace extends App {
     import org.apache.spark.sql.types._
 
     val cols = df.schema.fields.map { f =>
+      // Make column names predictable for ClickHouse (avoid case-sensitivity traps).
+      val outName = f.name.toLowerCase
       val c = col(f.name)
       f.dataType match {
-        case BooleanType => c.cast("byte").as(f.name)
-        case BinaryType => base64(c).as(f.name)
-        case _: ArrayType | _: MapType | _: StructType => to_json(c).as(f.name)
-        case d: DecimalType if d.precision > 76 => c.cast("string").as(f.name)
-        case _ => c.as(f.name)
+        case BooleanType => c.cast("byte").as(outName)
+        case BinaryType => base64(c).as(outName)
+        case _: ArrayType | _: MapType | _: StructType => to_json(c).as(outName)
+        case d: DecimalType if d.precision > 76 => c.cast("string").as(outName)
+        case _ => c.as(outName)
       }
     }
 
     df.select(cols: _*)
   }
+
+  private def partitionClause(partitionByOpt: Option[String]): String =
+    partitionByOpt.map(p => s"\nPARTITION BY ($p)").getOrElse("")
 
   private def buildCreateLocalDDL(df: DataFrame, comp: Compression): String = {
     val cols = df.schema.fields.map { f =>
@@ -241,7 +261,7 @@ object HiveToClickHouseReplace extends App {
        |    '$replicatedPath',
        |    '{replica}'
        |)
-       |PARTITION BY $chPartitionBy
+       |${partitionClause(chPartitionBy)}
        |ORDER BY ($chOrderBy)
        |SETTINGS allow_nullable_key = 1
        |""".stripMargin
@@ -269,10 +289,32 @@ object HiveToClickHouseReplace extends App {
     }
   }
 
-  private def truncateTables(conn: Connection): Unit = {
-    // truncating local is enough, but truncating distributed is harmless
-    execDDL(conn, s"TRUNCATE TABLE $chDb.$chLocalTable ON CLUSTER $chCluster")
-    execDDL(conn, s"TRUNCATE TABLE $chDb.$chTable ON CLUSTER $chCluster")
+  private def dropTables(conn: Connection): Unit = {
+    // Drop distributed first, then local.
+    execDDL(conn, s"DROP TABLE IF EXISTS $chDb.$chTable ON CLUSTER $chCluster")
+    execDDL(conn, s"DROP TABLE IF EXISTS $chDb.$chLocalTable ON CLUSTER $chCluster")
+  }
+
+  private def createDatabaseIfMissing(conn: Connection): Unit = {
+    execDDL(conn, s"CREATE DATABASE IF NOT EXISTS $chDb ON CLUSTER $chCluster")
+  }
+
+  private def validateOrderByAgainstDf(df: DataFrame, orderBy: String): Unit = {
+    // Best-effort: validate simple identifiers only; expressions are allowed in ClickHouse ORDER BY.
+    val dfColsLower = df.columns.map(_.toLowerCase).toSet
+    val parts = orderBy.split(",").map(_.trim).filter(_.nonEmpty)
+    parts.foreach { part =>
+      val cleaned = part
+        .replaceAll("`", "")
+        .replaceAll("""\s+""", " ")
+        .trim
+      if (cleaned.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+        require(
+          dfColsLower.contains(cleaned.toLowerCase),
+          s"ORDER BY column '$cleaned' is not present in DataFrame. Available: ${df.columns.sorted.mkString(", ")}"
+        )
+      }
+    }
   }
 
   // ===== Load Hive -> DF =====
@@ -290,19 +332,22 @@ object HiveToClickHouseReplace extends App {
 
   val (chHost, chPort) = parseHostAndPort(chHostRaw)
 
-  val shardingKeyExpr = chShardingKey.getOrElse(defaultShardingKey(chOrderBy))
+  val shardingSeed = chShardingKey.getOrElse(defaultShardingKeySeed(chOrderBy))
+  val shardingKeyExpr = safeShardingExpr(shardingSeed)
 
   // ===== Create/clean ClickHouse =====
   withConnection(chAdminUrl(chHost, chPort)) { conn =>
+    createDatabaseIfMissing(conn)
+    validateOrderByAgainstDf(normalized, chOrderBy)
     val ddlLocal = buildCreateLocalDDL(normalized, comp)
     val ddlDist = buildCreateDistributedDDL(shardingKeyExpr)
 
+    dropTables(conn)
     execDDL(conn, ddlLocal)
     execDDL(conn, ddlDist)
-    truncateTables(conn)
   }
 
-  // ===== Write data (replace already ensured by truncate) =====
+  // ===== Write data (replace ensured by DROP+CREATE) =====
   def writeChunk(chunk: DataFrame): Unit = {
     chunk.write
       .format("jdbc")
