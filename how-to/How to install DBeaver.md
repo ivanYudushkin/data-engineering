@@ -53,3 +53,48 @@ https://dbeaver.io/files/dbeaver-ce-latest-macos.dmg<br>
 <li>Выбрать тип нового соединения PostgreSQL Нажать Далее</li><br>
 <li>В поле аутентификация ввести пароль суперпользователя Базы данных Нажать Готово</li><br>
 </ol>
+
+## Troubleshooting: Greenplum/DBeaver ошибка `no pg_hba.conf entry ... SSL off`
+
+Если при подключении к Greenplum из DBeaver вы видите:
+
+`FATAL: no pg_hba.conf entry for host "10.21.225.108", user "popcorn", database "popcorn", SSL off`
+
+это значит, что на стороне Greenplum нет подходящего правила доступа в `pg_hba.conf` для вашего IP/пользователя/БД и текущего режима SSL.
+
+### 1) Добавьте правило в `pg_hba.conf` на координаторе Greenplum
+
+Пример для подключения **без SSL**:
+
+```conf
+hostnossl popcorn popcorn 10.21.225.108/32 md5
+```
+
+Пример для подключения **с SSL**:
+
+```conf
+hostssl popcorn popcorn 10.21.225.108/32 md5
+```
+
+Если нужно разрешить подсеть, используйте маску, например `10.21.225.0/24`.
+
+### 2) Примените изменения
+
+В Greenplum обычно достаточно перечитать конфигурацию:
+
+```bash
+gpstop -u
+```
+
+или из SQL:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+### 3) Проверьте SSL настройки в DBeaver
+
+- Если в `pg_hba.conf` строка `hostssl` -> в DBeaver включите SSL (`sslmode=require` или `prefer`).
+- Если строка `hostnossl` -> в DBeaver отключите SSL (`sslmode=disable`).
+
+Важно: текст `SSL off` в ошибке означает, что клиент пытался подключиться **без SSL**.
